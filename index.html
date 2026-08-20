@@ -542,6 +542,7 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xfaf8f3);
@@ -761,13 +762,14 @@ async function detectXR(){
   }
   renderModeList();
   renderXRButtons();
-  if(hasAR){ statusText.textContent = 'AR ready on this device'; statusPill.classList.add('live'); }
+  if(hasAR && hasVR){ statusText.textContent = 'AR & VR ready (Meta Quest)'; statusPill.classList.add('live'); }
+  else if(hasAR){ statusText.textContent = 'AR ready on this device'; statusPill.classList.add('live'); }
   else if(hasVR){ statusText.textContent = 'VR ready — Meta Quest detected'; statusPill.classList.add('live'); }
   else { statusText.textContent = 'No AR/VR — desktop preview mode'; }
 }
 function renderModeList(){
   modeList.innerHTML = `
-    <div class="mode-row ${hasAR?'':'off'}"><span class="tag">AR</span><span class="desc">Place furniture on your real floor with your camera</span></div>
+    <div class="mode-row ${hasAR?'':'off'}"><span class="tag">AR</span><span class="desc">Place furniture on your real floor with camera passthrough</span></div>
     <div class="mode-row ${hasVR?'':'off'}"><span class="tag">VR</span><span class="desc">Walk around a full-scale virtual room on Meta Quest</span></div>
     <div class="mode-row"><span class="tag">DESKTOP</span><span class="desc">Orbit-view preview, no headset required</span></div>
   `;
@@ -777,15 +779,17 @@ function renderXRButtons(){
   if(hasAR){
     const arBtn = ARButton.createButton(renderer, {
       requiredFeatures: ['hit-test'],
-      optionalFeatures: ['dom-overlay'],
-      domOverlay: { root: document.body }
+      optionalFeatures: ['local-floor', 'bounded-floor', 'hand-tracking', 'layers']
     });
     arBtn.className = 'xr-btn';
     arBtn.textContent = 'Enter AR';
     xrButtons.appendChild(arBtn);
   }
   if(hasVR){
-    const vrBtn = VRButton.createButton(renderer);
+    const vrBtn = VRButton.createButton(renderer, {
+      requiredFeatures: ['local-floor'],
+      optionalFeatures: ['bounded-floor', 'hand-tracking', 'layers']
+    });
     vrBtn.className = 'xr-btn secondary';
     vrBtn.textContent = 'Enter VR';
     xrButtons.appendChild(vrBtn);
@@ -972,39 +976,325 @@ document.getElementById('btn-clear').addEventListener('click', ()=>{
 });
 
 /* ---------------------------------------------------------
-   AR hit-test
+   WebXR Controllers, In-VR 3D Menu & AR Hit-Test
 ---------------------------------------------------------- */
 let hitTestSource = null;
 let hitTestSourceRequested = false;
 
-renderer.xr.addEventListener('sessionstart', () => {
-  const session = renderer.xr.getSession();
-  const mode = session.environmentBlendMode; // 'additive'/'alpha-blend' => AR passthrough, 'opaque' => VR
-  dockControls.style.display = 'flex';
-  virtualRoom.visible = (mode === 'opaque'); // show virtual room only in fully opaque VR
-  scene.background = (mode === 'opaque') ? new THREE.Color(0xfaf8f3) : null; // keep AR camera feed visible
-  hitTestSourceRequested = false;
-  hitTestSource = null;
+// Controller setup
+const controllers = [];
+const controllerRays = [];
+const tempMatrix = new THREE.Matrix4();
+const vrRaycaster = new THREE.Raycaster();
+const vrCursor = new THREE.Mesh(
+  new THREE.RingGeometry(0.04, 0.055, 32).rotateX(-Math.PI/2),
+  new THREE.MeshBasicMaterial({ color: 0xc9a227, side: THREE.DoubleSide, depthTest: false, transparent: true, opacity: 0.85 })
+);
+vrCursor.visible = false;
+vrCursor.renderOrder = 999;
+scene.add(vrCursor);
 
-  session.addEventListener('select', () => {
-    if (reticle.visible) {
-      const pos = new THREE.Vector3().setFromMatrixPosition(reticle.matrix);
-      handleTapAt(pos);
-    } else if (mode === 'opaque') {
-      // VR without hit-test: place/move a fixed distance in front of the viewer
-      const dir = new THREE.Vector3();
-      camera.getWorldDirection(dir);
-      dir.y = 0; dir.normalize();
-      const pos = camera.position.clone().addScaledVector(dir, 1.2);
-      pos.y = 0;
-      handleTapAt(pos);
+// VR Interactive Buttons Registry
+const vrInteractiveButtons = [];
+let hoveredVRButton = null;
+
+// ---------------------------------------------------------
+// 3D In-VR Menu Panel (Visible in VR on Meta Quest)
+// ---------------------------------------------------------
+const vrMenu = new THREE.Group();
+vrMenu.position.set(0, 1.25, -1.35);
+vrMenu.rotation.x = -0.08;
+vrMenu.visible = false;
+scene.add(vrMenu);
+
+function createVRButtonCanvas(text, subtext = '', bgColor = '#1e2027', textColor = '#f2efe9', borderColor = '#c9a227', isSelected = false){
+  const c = document.createElement('canvas');
+  c.width = 256; c.height = 128;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = isSelected ? '#342f1a' : bgColor;
+  ctx.roundRect ? ctx.roundRect(4, 4, 248, 120, 16) : ctx.fillRect(4, 4, 248, 120);
+  ctx.fill();
+  ctx.strokeStyle = isSelected ? '#c9a227' : (borderColor || 'rgba(242,239,233,0.15)');
+  ctx.lineWidth = isSelected ? 6 : 3;
+  ctx.stroke();
+
+  ctx.fillStyle = isSelected ? '#f5d77f' : textColor;
+  ctx.font = 'bold 26px Inter, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = subtext ? 'bottom' : 'middle';
+  ctx.fillText(text, 128, subtext ? 64 : 64);
+
+  if (subtext) {
+    ctx.fillStyle = '#9a9ca5';
+    ctx.font = '18px JetBrains Mono, monospace';
+    ctx.textBaseline = 'top';
+    ctx.fillText(subtext, 128, 72);
+  }
+
+  const texture = new THREE.CanvasTexture(c);
+  texture.minFilter = THREE.LinearFilter;
+  return texture;
+}
+
+function buildVRMenu(){
+  while(vrMenu.children.length > 0){
+    const obj = vrMenu.children[0];
+    vrMenu.remove(obj);
+  }
+  vrInteractiveButtons.length = 0;
+
+  // Background Glass Panel
+  const panelGeo = new THREE.PlaneGeometry(1.65, 0.88);
+  const panelMat = new THREE.MeshStandardMaterial({
+    color: 0x14151a,
+    roughness: 0.3,
+    metalness: 0.1,
+    transparent: true,
+    opacity: 0.88,
+    side: THREE.DoubleSide
+  });
+  const panel = new THREE.Mesh(panelGeo, panelMat);
+  panel.position.z = -0.01;
+  vrMenu.add(panel);
+
+  // Title Banner
+  const titleCanvas = document.createElement('canvas');
+  titleCanvas.width = 512; titleCanvas.height = 80;
+  const tctx = titleCanvas.getContext('2d');
+  tctx.fillStyle = '#14151a';
+  tctx.fillRect(0,0,512,80);
+  tctx.fillStyle = '#f2efe9';
+  tctx.font = 'bold 28px Fraunces, serif';
+  tctx.fillText('Room & Board — VR Studio', 20, 48);
+  tctx.fillStyle = '#c9a227';
+  tctx.font = 'bold 16px Inter, sans-serif';
+  tctx.fillText('POINT & TRIGGER TO PLACE / SELECT', 340, 48);
+  const titleTex = new THREE.CanvasTexture(titleCanvas);
+  const titleMesh = new THREE.Mesh(new THREE.PlaneGeometry(1.5, 0.16), new THREE.MeshBasicMaterial({ map: titleTex, transparent: true }));
+  titleMesh.position.set(0, 0.33, 0.005);
+  vrMenu.add(titleMesh);
+
+  // Catalog Swatches (2 rows of 4)
+  const btnGeo = new THREE.PlaneGeometry(0.33, 0.16);
+  CATALOG.forEach((item, i) => {
+    const col = i % 4;
+    const row = Math.floor(i / 4);
+    const x = -0.525 + col * 0.35;
+    const y = 0.14 - row * 0.18;
+    const isSel = (item.id === selectedCatalogId);
+
+    const tex = createVRButtonCanvas(item.name, `#${item.swatch.toString(16).padStart(6,'0')}`, '#1e2027', '#f2efe9', '#444854', isSel);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+    const btn = new THREE.Mesh(btnGeo, mat);
+    btn.position.set(x, y, 0.01);
+    btn.userData = {
+      type: 'catalog',
+      id: item.id,
+      name: item.name,
+      baseTexture: tex
+    };
+    vrMenu.add(btn);
+    vrInteractiveButtons.push(btn);
+  });
+
+  // Action Buttons row at bottom
+  const actionItems = [
+    { label: '⟲ Rot L', act: () => { if(selectedItem){ if(WALL_MOUNTED.has(selectedItem.userData.catId)){ cycleWall(selectedItem,-1); } else { selectedItem.rotation.y -= Math.PI/8; } refreshSelectionHelper(); showToast('Rotated Left'); } } },
+    { label: '⟳ Rot R', act: () => { if(selectedItem){ if(WALL_MOUNTED.has(selectedItem.userData.catId)){ cycleWall(selectedItem,1); } else { selectedItem.rotation.y += Math.PI/8; } refreshSelectionHelper(); showToast('Rotated Right'); } } },
+    { label: '⬆ Up',    act: () => { if(selectedItem){ const {maxY}=heightRange(selectedItem); selectedItem.position.y=Math.min(selectedItem.position.y+0.08, maxY); refreshSelectionHelper(); } } },
+    { label: '⬇ Down',  act: () => { if(selectedItem){ const {minY}=heightRange(selectedItem); selectedItem.position.y=Math.max(selectedItem.position.y-0.08, minY); refreshSelectionHelper(); } } },
+    { label: '– Scl -', act: () => { if(selectedItem){ selectedItem.scale.multiplyScalar(0.92); refreshSelectionHelper(); } } },
+    { label: '+ Scl +', act: () => { if(selectedItem){ selectedItem.scale.multiplyScalar(1.08); refreshSelectionHelper(); } } },
+    { label: '✥ Move',  act: () => { if(selectedItem){ setMoveMode(!moveMode); } else { showToast('Select a piece first'); } } },
+    { label: '⌫ Del',   act: () => { document.getElementById('btn-undo').click(); } },
+    { label: '⨯ Clear', act: () => { document.getElementById('btn-clear').click(); } }
+  ];
+
+  const actBtnGeo = new THREE.PlaneGeometry(0.155, 0.12);
+  actionItems.forEach((act, i) => {
+    const x = -0.62 + i * 0.155;
+    const y = -0.27;
+    const tex = createVRButtonCanvas(act.label, '', '#272932', '#f2efe9', '#555866', false);
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true });
+    const btn = new THREE.Mesh(actBtnGeo, mat);
+    btn.position.set(x, y, 0.01);
+    btn.userData = {
+      type: 'action',
+      label: act.label,
+      action: act.act,
+      baseTexture: tex
+    };
+    vrMenu.add(btn);
+    vrInteractiveButtons.push(btn);
+  });
+}
+
+function updateVRMenuSelection(){
+  vrInteractiveButtons.forEach(btn => {
+    if (btn.userData.type === 'catalog') {
+      const isSel = (btn.userData.id === selectedCatalogId);
+      const item = CATALOG.find(c => c.id === btn.userData.id);
+      if (item) {
+        btn.material.map = createVRButtonCanvas(item.name, `#${item.swatch.toString(16).padStart(6,'0')}`, '#1e2027', '#f2efe9', '#444854', isSel);
+        btn.material.needsUpdate = true;
+      }
     }
   });
+}
+
+// Build initial VR menu
+buildVRMenu();
+
+// ---------------------------------------------------------
+// Setup WebXR Controllers with pointer beam and click handling
+// ---------------------------------------------------------
+function buildControllerRay(){
+  const geometry = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, 0, -3)
+  ]);
+  const material = new THREE.LineBasicMaterial({
+    color: 0xc9a227,
+    transparent: true,
+    opacity: 0.65,
+    linewidth: 2
+  });
+  return new THREE.Line(geometry, material);
+}
+
+function onControllerSelectStart(event){
+  const controller = event.target;
+  controller.userData.isSelecting = true;
+}
+
+function onControllerSelectEnd(event){
+  const controller = event.target;
+  controller.userData.isSelecting = false;
+}
+
+function onControllerSelect(event){
+  const controller = event.target;
+  tempMatrix.identity().extractRotation(controller.matrixWorld);
+  vrRaycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+  vrRaycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+
+  // 1. Raycast against 3D VR Menu buttons
+  if (vrMenu.visible) {
+    const menuHits = vrRaycaster.intersectObjects(vrInteractiveButtons, false);
+    if (menuHits.length > 0) {
+      const hitBtn = menuHits[0].object;
+      if (hitBtn.userData.type === 'catalog') {
+        selectedCatalogId = (selectedCatalogId === hitBtn.userData.id) ? null : hitBtn.userData.id;
+        [...rail.children].forEach(c => {
+          c.classList.toggle('selected', c.dataset.id === selectedCatalogId);
+        });
+        updateVRMenuSelection();
+        const cat = CATALOG.find(c => c.id === selectedCatalogId);
+        showToast(cat ? `${cat.name} selected` : 'Piece deselected');
+      } else if (hitBtn.userData.type === 'action' && hitBtn.userData.action) {
+        hitBtn.userData.action();
+      }
+      return;
+    }
+  }
+
+  // 2. Raycast against placed furniture
+  const pieceHits = vrRaycaster.intersectObjects(placedItems, true);
+  if (pieceHits.length > 0) {
+    const root = rootGroupOf(pieceHits[0].object);
+    selectItem(root);
+    showToast(`Selected ${root.userData.name}`);
+    return;
+  }
+
+  // 3. Raycast against floor plane
+  const floorHit = new THREE.Vector3();
+  if (vrRaycaster.ray.intersectPlane(floorPlane, floorHit)) {
+    if (floorHit.length() < 3.2) {
+      handleTapAt(floorHit);
+    }
+  }
+}
+
+function onControllerSqueeze(event){
+  // Grip button: Rotate or cycle wall quickly
+  if (selectedItem) {
+    if (WALL_MOUNTED.has(selectedItem.userData.catId)) {
+      cycleWall(selectedItem, 1);
+    } else {
+      selectedItem.rotation.y += Math.PI / 4;
+    }
+    refreshSelectionHelper();
+    showToast('Rotated');
+  }
+}
+
+for (let i = 0; i < 2; i++) {
+  const controller = renderer.xr.getController(i);
+  controller.addEventListener('selectstart', onControllerSelectStart);
+  controller.addEventListener('selectend', onControllerSelectEnd);
+  controller.addEventListener('select', onControllerSelect);
+  controller.addEventListener('squeezestart', onControllerSqueeze);
+
+  const ray = buildControllerRay();
+  controller.add(ray);
+  scene.add(controller);
+
+  controllers.push(controller);
+  controllerRays.push(ray);
+
+  const controllerGrip = renderer.xr.getControllerGrip(i);
+  // Add a small controller visual handle
+  const gripGeo = new THREE.CylinderGeometry(0.015, 0.02, 0.12, 16);
+  gripGeo.rotateX(Math.PI / 3);
+  const gripMesh = new THREE.Mesh(gripGeo, new THREE.MeshStandardMaterial({ color: 0x3b3e46, roughness: 0.4, metalness: 0.6 }));
+  controllerGrip.add(gripMesh);
+  scene.add(controllerGrip);
+}
+
+// ---------------------------------------------------------
+// WebXR Session Lifecycle Handlers
+// ---------------------------------------------------------
+renderer.xr.addEventListener('sessionstart', () => {
+  const session = renderer.xr.getSession();
+  const isAR = (session && session.mode === 'immersive-ar');
+  const isVR = (session && session.mode === 'immersive-vr');
+
+  dockControls.style.display = 'flex';
+  orbit.enabled = false;
+
+  if (isAR) {
+    virtualRoom.visible = false;
+    scene.background = null;
+    vrMenu.visible = false;
+    statusText.textContent = 'AR Passthrough Active';
+  } else {
+    // VR Mode on Meta Quest
+    virtualRoom.visible = true;
+    scene.background = new THREE.Color(0x14151a);
+    vrMenu.visible = true;
+    updateVRMenuSelection();
+    // Position VR Menu 1.3m in front of starting position
+    vrMenu.position.set(0, 1.25, -1.35);
+    vrMenu.rotation.set(-0.08, 0, 0);
+    statusText.textContent = 'VR Room Active (Meta Quest)';
+  }
+
+  hitTestSourceRequested = false;
+  hitTestSource = null;
+  showToast(isAR ? 'AR Mode active' : 'VR Studio active');
 });
+
 renderer.xr.addEventListener('sessionend', () => {
   reticle.visible = false;
+  vrCursor.visible = false;
+  vrMenu.visible = false;
   virtualRoom.visible = true;
   scene.background = new THREE.Color(0xfaf8f3);
+  orbit.enabled = true;
+  hitTestSourceRequested = false;
+  hitTestSource = null;
+  statusText.textContent = 'Preview active';
 });
 
 /* ---------------------------------------------------------
@@ -1073,8 +1363,6 @@ window.addEventListener('keydown', (ev) => {
   selectedItem.position.z = Math.max(-ROOM_HALF, Math.min(ROOM_HALF, selectedItem.position.z));
   selectedItem.position.y = Math.max(-1.5, Math.min(2.2, selectedItem.position.y));
   { const { minY, maxY } = heightRange(selectedItem); selectedItem.position.y = Math.max(minY, Math.min(maxY, selectedItem.position.y)); }
-  // Wall-mounted pieces slide along their wall but stay pinned to it —
-  // clamp the tangential coordinate so they can't drift into the room.
   if (WALL_MOUNTED.has(selectedItem.userData.catId)) {
     const r = selectedItem.rotation.y;
     if (r === 0 || r === Math.PI) {
@@ -1089,42 +1377,105 @@ window.addEventListener('keydown', (ev) => {
 });
 
 /* ---------------------------------------------------------
-   Render loop
+   Crash-Proof Render Loop with WebXR Support
 ---------------------------------------------------------- */
 renderer.setAnimationLoop((timestamp, frame) => {
-  if (frame) {
-    const session = renderer.xr.getSession();
-    const refSpace = renderer.xr.getReferenceSpace();
+  try {
+    if (frame) {
+      const session = renderer.xr.getSession();
+      const refSpace = renderer.xr.getReferenceSpace();
 
-    if (!hitTestSourceRequested) {
-      session.requestReferenceSpace('viewer').then((viewerSpace) => {
-        if (session.requestHitTestSource) {
-          session.requestHitTestSource({ space: viewerSpace }).then((source) => {
-            hitTestSource = source;
-          }).catch(()=>{ hitTestSource = null; });
+      // Only perform AR hit testing in immersive-ar sessions
+      if (session && session.mode === 'immersive-ar') {
+        if (!hitTestSourceRequested) {
+          if (session.requestReferenceSpace && session.requestHitTestSource) {
+            session.requestReferenceSpace('viewer').then((viewerSpace) => {
+              if (session.requestHitTestSource) {
+                session.requestHitTestSource({ space: viewerSpace }).then((source) => {
+                  hitTestSource = source;
+                }).catch(() => { hitTestSource = null; });
+              }
+            }).catch(() => { hitTestSource = null; });
+          }
+          session.addEventListener('end', () => {
+            hitTestSourceRequested = false;
+            hitTestSource = null;
+          }, { once: true });
+          hitTestSourceRequested = true;
         }
-      });
-      session.addEventListener('end', () => {
-        hitTestSourceRequested = false;
-        hitTestSource = null;
-      });
-      hitTestSourceRequested = true;
-    }
 
-    if (hitTestSource) {
-      const results = frame.getHitTestResults(hitTestSource);
-      if (results.length > 0) {
-        const pose = results[0].getPose(refSpace);
-        reticle.visible = true;
-        reticle.matrix.fromArray(pose.transform.matrix);
+        if (hitTestSource && refSpace) {
+          try {
+            const results = frame.getHitTestResults(hitTestSource);
+            if (results && results.length > 0) {
+              const pose = results[0].getPose(refSpace);
+              if (pose && pose.transform && pose.transform.matrix) {
+                reticle.visible = true;
+                reticle.matrix.fromArray(pose.transform.matrix);
+              } else {
+                reticle.visible = false;
+              }
+            } else {
+              reticle.visible = false;
+            }
+          } catch (err) {
+            reticle.visible = false;
+          }
+        }
       } else {
         reticle.visible = false;
       }
+
+      // Update VR controller raycasting & hovering
+      let cursorActive = false;
+      controllers.forEach((controller) => {
+        if (!controller.visible) return;
+        tempMatrix.identity().extractRotation(controller.matrixWorld);
+        vrRaycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+        vrRaycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+
+        // Hover over 3D VR Menu buttons
+        if (vrMenu.visible) {
+          const menuHits = vrRaycaster.intersectObjects(vrInteractiveButtons, false);
+          if (menuHits.length > 0) {
+            const hovered = menuHits[0].object;
+            if (hoveredVRButton && hoveredVRButton !== hovered) {
+              hoveredVRButton.scale.set(1, 1, 1);
+            }
+            hoveredVRButton = hovered;
+            hovered.scale.set(1.08, 1.08, 1.08);
+            return;
+          }
+        }
+
+        // Floor pointer cursor in VR
+        const floorHit = new THREE.Vector3();
+        if (vrRaycaster.ray.intersectPlane(floorPlane, floorHit)) {
+          if (floorHit.length() < 3.5) {
+            vrCursor.position.set(floorHit.x, 0.015, floorHit.z);
+            vrCursor.visible = true;
+            cursorActive = true;
+          }
+        }
+      });
+
+      if (!cursorActive && !vrMenu.visible) {
+        vrCursor.visible = false;
+      }
+      if (hoveredVRButton && (!vrMenu.visible || controllers.every(c => !c.visible))) {
+        hoveredVRButton.scale.set(1, 1, 1);
+        hoveredVRButton = null;
+      }
+
+    } else {
+      orbit.update();
     }
-  } else {
-    orbit.update();
+
+    refreshSelectionHelper();
+    renderer.render(scene, camera);
+  } catch (loopError) {
+    console.error('Render loop safe catch:', loopError);
   }
-  renderer.render(scene, camera);
 });
 
 window.addEventListener('resize', () => {
